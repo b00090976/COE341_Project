@@ -1,0 +1,659 @@
+# Basic Computer Simulator for Mano's architecture
+# COE 341 Project
+
+# This code simulates:
+# - Registers: AC, DR, AR, IR, PC, TR, E, I
+# - 4096 words of 16-bit memory
+# - Fetch–Decode–Execute cycle with micro-steps (T0..T6)
+# - All memory-reference and register-reference instructions (no I/O)
+# - CLI commands: next_cycle, fast_cycle, next_inst, fast_inst, run, show ...
+
+class BasicComputerSimulator:
+    def __init__(self):
+        # 4096 x 16-bit memory
+        self.memory = [0] * 4096
+
+        # Registers
+        self.AC = 0
+        self.DR = 0
+        self.AR = 0
+        self.IR = 0
+        self.PC = 0
+        self.TR = 0
+        self.E = 0
+        self.I = 0
+
+        # Micro-step counter: 0 = T0, 1 = T1, ...
+        self.micro_phase = 0
+
+        # Halt flag
+        self.halted = False
+
+        # Profiler
+        self.cycle_counter = 0
+        self.instruction_counter = 0
+        self.read_count = 0
+        self.write_count = 0
+
+        # Last completed instruction and halt PC
+        self.last_executed_instruction = None
+        self.halt_pc = None
+
+    # ---------------------------------------------------------
+    # Program and data loading
+    # ---------------------------------------------------------
+    def load_program(self, program_file="program.txt", data_file="data.txt"):
+        # Reset memory and state
+        self.memory = [0] * 4096
+        self.AC = 0
+        self.DR = 0
+        self.AR = 0
+        self.IR = 0
+        self.PC = 0
+        self.TR = 0
+        self.E = 0
+        self.I = 0
+        self.micro_phase = 0
+        self.halted = False
+        self.cycle_counter = 0
+        self.instruction_counter = 0
+        self.read_count = 0
+        self.write_count = 0
+        self.halt_pc = None
+        self.last_executed_instruction = None
+
+        def parse_file(path):
+            entries = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    # Remove comments after '#'
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    addr_str = parts[0]
+                    val_str = parts[1]
+
+                    # Hex address and value
+                    address = int(addr_str, 16)
+                    value = int(val_str, 16)
+
+                    if not (0 <= address < 4096):
+                        raise ValueError(f"Address {addr_str} out of range")
+                    if not (0 <= value < 65536):
+                        raise ValueError(f"Value {val_str} out of range")
+
+                    entries.append((address, value))
+            return entries
+
+        # Program file must exist
+        program_entries = parse_file(program_file)
+
+        # Data file is optional
+        data_entries = []
+        if data_file is not None:
+            try:
+                data_entries = parse_file(data_file)
+            except FileNotFoundError:
+                data_entries = []
+
+        # First load data, then program overrides same addresses
+        for addr, val in data_entries:
+            self.memory[addr] = val & 0xFFFF
+
+        for addr, val in program_entries:
+            self.memory[addr] = val & 0xFFFF
+
+        # Start PC at smallest program address if exists
+        if program_entries:
+            min_addr = min(addr for addr, _ in program_entries)
+            self.PC = min_addr & 0xFFF
+        else:
+            self.PC = 0
+
+    # ---------------------------------------------------------
+    # Execution (micro cycles, instructions, run)
+    # ---------------------------------------------------------
+    def next_cycle(self):
+        """Execute one micro-step (one clock cycle)."""
+        if self.halted:
+            return ("Simulator halted", [])
+
+        changed = []
+        micro_op = ""
+
+        # Count each micro-step as one cycle
+        self.cycle_counter += 1
+        phase = self.micro_phase
+
+        # T0: AR <- PC
+        if phase == 0:
+            self.AR = self.PC & 0xFFF
+            changed.append("AR")
+            micro_op = "T0: AR ← PC"
+            self.micro_phase = 1
+
+        # T1: IR <- M[AR]; PC <- PC + 1
+        elif phase == 1:
+            self.IR = self.memory[self.AR] & 0xFFFF
+            self.read_count += 1
+            self.PC = (self.PC + 1) & 0xFFF
+            changed.extend(["IR", "PC"])
+            micro_op = "T1: IR ← M[AR]; PC ← PC + 1"
+            self.micro_phase = 2
+
+        # T2: AR <- IR[0..11]; I <- IR[15]
+        elif phase == 2:
+            self.AR = self.IR & 0x0FFF
+            self.I = 1 if (self.IR & 0x8000) else 0
+            changed.extend(["AR", "I"])
+            micro_op = "T2: AR ← IR[0–11]; I ← IR[15]"
+            self.micro_phase = 3
+
+        else:
+            # From T3 onwards we execute the actual instruction
+            opcode = (self.IR >> 12) & 0x7  # bits 14–12
+
+            # Register-reference: opcode=7 and I=0
+            if opcode == 7 and self.I == 0:
+                reg_changed = []
+                ops = []
+                ir = self.IR & 0x0FFF
+
+                # CLA (bit 11)
+                if ir & 0x800:
+                    self.AC = 0
+                    reg_changed.append("AC")
+                    ops.append("CLA")
+
+                # CLE (bit 10)
+                if ir & 0x400:
+                    self.E = 0
+                    reg_changed.append("E")
+                    ops.append("CLE")
+
+                # CMA (bit 9)
+                if ir & 0x200:
+                    self.AC = (~self.AC) & 0xFFFF
+                    reg_changed.append("AC")
+                    ops.append("CMA")
+
+                # CME (bit 8)
+                if ir & 0x100:
+                    self.E ^= 1
+                    reg_changed.append("E")
+                    ops.append("CME")
+
+                # CIR (bit 7) – rotate right through E
+                if ir & 0x80:
+                    combined = (self.E << 16) | self.AC   # 17 bits: [E][AC15..0]
+                    new_carry = combined & 1              # bit 0
+                    combined >>= 1                        # shift right
+                    if new_carry:
+                        combined |= (1 << 16)            # wrap around into MSB
+                    self.E = (combined >> 16) & 1
+                    self.AC = combined & 0xFFFF
+                    reg_changed.extend(["AC", "E"])
+                    ops.append("CIR")
+
+                # CIL (bit 6) – rotate left through E
+                if ir & 0x40:
+                    combined = (self.AC << 1) | self.E   # [AC14..0][E]
+                    combined &= 0x1FFFF                  # keep 17 bits
+                    new_carry = (combined >> 16) & 1
+                    self.E = new_carry
+                    self.AC = combined & 0xFFFF
+                    reg_changed.extend(["AC", "E"])
+                    ops.append("CIL")
+
+                # INC (bit 5)
+                if ir & 0x20:
+                    self.AC = (self.AC + 1) & 0xFFFF
+                    reg_changed.append("AC")
+                    ops.append("INC")
+
+                # SPA (bit 4)
+                if ir & 0x10:
+                    if (self.AC & 0x8000) == 0:
+                        self.PC = (self.PC + 1) & 0xFFF
+                        reg_changed.append("PC")
+                        ops.append("SPA (skip)")
+
+                # SNA (bit 3)
+                if ir & 0x8:
+                    if (self.AC & 0x8000) != 0:
+                        self.PC = (self.PC + 1) & 0xFFF
+                        reg_changed.append("PC")
+                        ops.append("SNA (skip)")
+
+                # SZA (bit 2)
+                if ir & 0x4:
+                    if self.AC == 0:
+                        self.PC = (self.PC + 1) & 0xFFF
+                        reg_changed.append("PC")
+                        ops.append("SZA (skip)")
+
+                # SZE (bit 1)
+                if ir & 0x2:
+                    if self.E == 0:
+                        self.PC = (self.PC + 1) & 0xFFF
+                        reg_changed.append("PC")
+                        ops.append("SZE (skip)")
+
+                # HLT (bit 0)
+                if ir & 0x1:
+                    self.halted = True
+                    self.halt_pc = self.PC
+                    ops.append("HLT")
+
+                micro_op = "T3: " + ", ".join(ops) if ops else "T3: NOP"
+                changed.extend(reg_changed)
+
+                # Finish instruction
+                self.last_executed_instruction = self.IR & 0xFFFF
+                self.micro_phase = 0
+                self.instruction_counter += 1
+
+            else:
+                # Memory-reference (opcode 0..6)
+                inst_code = opcode
+
+                # T3: handle indirect addressing if I=1
+                if phase == 3:
+                    if self.I == 1:
+                        self.AR = self.memory[self.AR] & 0xFFFF
+                        self.read_count += 1
+                        self.AR &= 0x0FFF
+                        changed.append("AR")
+                        micro_op = "T3: AR ← M[AR] (indirect)"
+                    else:
+                        micro_op = "T3: (direct)"
+                    self.micro_phase = 4
+
+                # T4: first execution step
+                elif phase == 4:
+                    if inst_code in (0, 1, 2, 6):  # AND, ADD, LDA, ISZ
+                        self.DR = self.memory[self.AR] & 0xFFFF
+                        self.read_count += 1
+                        changed.append("DR")
+                        micro_op = "T4: DR ← M[AR]"
+                        if inst_code == 6:
+                            self.micro_phase = 5  # ISZ goes to T5
+                        else:
+                            self.micro_phase = 5
+
+                    elif inst_code == 3:  # STA
+                        self.memory[self.AR] = self.AC & 0xFFFF
+                        self.write_count += 1
+                        changed.append(f"M[{self.AR:03X}]")
+                        micro_op = "T4: M[AR] ← AC"
+                        self.last_executed_instruction = self.IR & 0xFFFF
+                        self.micro_phase = 0
+                        self.instruction_counter += 1
+
+                    elif inst_code == 4:  # BUN
+                        self.PC = self.AR & 0xFFF
+                        changed.append("PC")
+                        micro_op = "T4: PC ← AR"
+                        self.last_executed_instruction = self.IR & 0xFFFF
+                        self.micro_phase = 0
+                        self.instruction_counter += 1
+
+                    elif inst_code == 5:  # BSA
+                        self.memory[self.AR] = self.PC & 0xFFFF
+                        self.write_count += 1
+                        changed.append(f"M[{self.AR:03X}]")
+                        micro_op = "T4: M[AR] ← PC"
+                        self.micro_phase = 5
+
+                    else:
+                        micro_op = "Invalid instruction"
+                        self.last_executed_instruction = self.IR & 0xFFFF
+                        self.micro_phase = 0
+                        self.instruction_counter += 1
+
+                # T5: second execution step
+                elif phase == 5:
+                    if inst_code == 0:  # AND
+                        self.AC = self.AC & self.DR
+                        changed.append("AC")
+                        micro_op = "T5: AC ← AC ∧ DR"
+                        self.last_executed_instruction = self.IR & 0xFFFF
+                        self.micro_phase = 0
+                        self.instruction_counter += 1
+
+                    elif inst_code == 1:  # ADD
+                        total = self.AC + self.DR
+                        self.E = 1 if total > 0xFFFF else 0
+                        self.AC = total & 0xFFFF
+                        changed.extend(["AC", "E"])
+                        micro_op = "T5: AC ← AC + DR; E ← carry"
+                        self.last_executed_instruction = self.IR & 0xFFFF
+                        self.micro_phase = 0
+                        self.instruction_counter += 1
+
+                    elif inst_code == 2:  # LDA
+                        self.AC = self.DR & 0xFFFF
+                        changed.append("AC")
+                        micro_op = "T5: AC ← DR"
+                        self.last_executed_instruction = self.IR & 0xFFFF
+                        self.micro_phase = 0
+                        self.instruction_counter += 1
+
+                    elif inst_code == 5:  # BSA
+                        self.PC = (self.AR + 1) & 0xFFF
+                        changed.append("PC")
+                        micro_op = "T5: PC ← AR + 1"
+                        self.last_executed_instruction = self.IR & 0xFFFF
+                        self.micro_phase = 0
+                        self.instruction_counter += 1
+
+                    elif inst_code == 6:  # ISZ
+                        self.DR = (self.DR + 1) & 0xFFFF
+                        self.memory[self.AR] = self.DR & 0xFFFF
+                        self.write_count += 1
+                        changed.extend(["DR", f"M[{self.AR:03X}]"])
+                        micro_op = "T5: DR ← DR + 1; M[AR] ← DR"
+                        self.micro_phase = 6
+
+                    else:
+                        micro_op = "Invalid T5"
+                        self.last_executed_instruction = self.IR & 0xFFFF
+                        self.micro_phase = 0
+                        self.instruction_counter += 1
+
+                # T6: only for ISZ
+                elif phase == 6 and inst_code == 6:
+                    if self.DR == 0:
+                        self.PC = (self.PC + 1) & 0xFFF
+                        changed.append("PC")
+                        micro_op = "T6: DR = 0 → PC ← PC + 1"
+                    else:
+                        micro_op = "T6: DR ≠ 0"
+                    self.last_executed_instruction = self.IR & 0xFFFF
+                    self.micro_phase = 0
+                    self.instruction_counter += 1
+                else:
+                    micro_op = "Idle"
+                    self.last_executed_instruction = self.IR & 0xFFFF
+                    self.micro_phase = 0
+                    self.instruction_counter += 1
+
+        # Remove duplicates in "changed" list while keeping order
+        seen = set()
+        unique_changed = []
+        for x in changed:
+            if x not in seen:
+                seen.add(x)
+                unique_changed.append(x)
+
+        return (micro_op, unique_changed)
+
+    def fast_cycle(self, n):
+        last_op = ""
+        last_changed = []
+        n = max(0, n)
+        for _ in range(n):
+            op, ch = self.next_cycle()
+            last_op, last_changed = op, ch
+            if self.halted:
+                break
+        return (last_op, last_changed)
+
+    def next_inst(self):
+        if self.halted:
+            return ("HLT", {"AC": self.AC, "PC": self.PC})
+
+        # Run cycles until instruction boundary (SC back to 0)
+        while True:
+            _, _ = self.next_cycle()
+            if self.micro_phase == 0 or self.halted:
+                break
+
+        executed = self.last_executed_instruction
+        if executed is None:
+            executed = self.IR
+
+        inst_hex = f"0x{executed & 0xFFFF:04X}"
+        state = {"AC": self.AC, "PC": self.PC}
+        return (inst_hex, state)
+
+    def fast_inst(self, n):
+        last_inst = ""
+        last_state = {}
+        n = max(0, n)
+        for _ in range(n):
+            inst, state = self.next_inst()
+            last_inst, last_state = inst, state
+            if self.halted:
+                break
+        return (last_inst, last_state)
+
+    def run(self):
+        last_inst = ""
+        last_state = {}
+        while not self.halted:
+            inst, state = self.next_inst()
+            last_inst, last_state = inst, state
+            if self.halted:
+                break
+        return (last_inst, last_state)
+
+    # ---------------------------------------------------------
+    # Inspection helpers
+    # ---------------------------------------------------------
+    def _format_binary(self, value, bits):
+        b = f"{value:0{bits}b}"
+        groups = []
+        for i in range(0, bits, 4):
+            groups.append(b[i:i+4])
+        return " ".join(groups)
+
+    def show_register(self, name):
+        name = name.upper()
+        if name == "AC":
+            return f"AC = 0x{self.AC:04X} (binary: {self._format_binary(self.AC, 16)})"
+        elif name == "DR":
+            return f"DR = 0x{self.DR:04X} (binary: {self._format_binary(self.DR, 16)})"
+        elif name == "AR":
+            return f"AR = 0x{self.AR:03X} (binary: {self._format_binary(self.AR, 12)})"
+        elif name == "PC":
+            return f"PC = 0x{self.PC:03X} (binary: {self._format_binary(self.PC, 12)})"
+        elif name == "IR":
+            return f"IR = 0x{self.IR:04X} (binary: {self._format_binary(self.IR, 16)})"
+        elif name == "TR":
+            return f"TR = 0x{self.TR:04X} (binary: {self._format_binary(self.TR, 16)})"
+        elif name == "E":
+            return f"E = {self.E}"
+        elif name == "I":
+            return f"I = {self.I}"
+        else:
+            return f"Unknown register: {name}"
+
+    def show_memory(self, addr, count=1):
+        lines = []
+        count = max(1, count)
+        for offset in range(count):
+            a = addr + offset
+            if 0 <= a < len(self.memory):
+                value = self.memory[a] & 0xFFFF
+                if count == 1:
+                    bin_rep = self._format_binary(value, 16)
+                    lines.append(f"M[{a}] = 0x{value:04X} (binary: {bin_rep})")
+                else:
+                    lines.append(f"0x{a:03X}   | 0x{value:04X}")
+        return "\n".join(lines)
+
+    def show_all(self):
+        return (
+            f"AC=0x{self.AC:04X}  DR=0x{self.DR:04X}  AR=0x{self.AR:03X}  "
+            f"PC=0x{self.PC:03X}  IR=0x{self.IR:04X}  TR=0x{self.TR:04X}  "
+            f"E={self.E}  I={self.I}  SC={self.micro_phase}"
+        )
+
+    def show_profiler(self):
+        # Avoid divide by zero if no instruction executed yet
+        inst = self.instruction_counter if self.instruction_counter > 0 else 1
+        cpi = self.cycle_counter / inst
+        mbw = self.read_count + self.write_count
+        return (
+            f"Total cycles: {self.cycle_counter}\n"
+            f"Instructions executed: {self.instruction_counter}\n"
+            f"Average cycles per instruction (CPI): {cpi:.2f}\n"
+            f"Memory reads: {self.read_count}\n"
+            f"Memory writes: {self.write_count}\n"
+            f"Memory bandwidth (reads + writes): {mbw}"
+        )
+
+    # ---------------------------------------------------------
+    # CLI commands
+    # ---------------------------------------------------------
+    def execute_command(self, command):
+        cmd = command.strip()
+        if not cmd:
+            return ""
+
+        tokens = cmd.split()
+        base = tokens[0].lower()
+
+        if base == "next_cycle":
+            op, changed = self.next_cycle()
+            inst_in_hand = f"0x{self.IR:04X}"
+            changed_str = ", ".join(changed) if changed else "None"
+            return (
+                f"Instruction in hand: {inst_in_hand}\n"
+                f"Micro-operation: {op}\n"
+                f"Changed: {changed_str}"
+            )
+
+        elif base == "fast_cycle":
+            if len(tokens) < 2 or not tokens[1].isdigit():
+                return "Usage: fast_cycle N"
+            n = int(tokens[1])
+            op, changed = self.fast_cycle(n)
+            inst_in_hand = f"0x{self.IR:04X}"
+            changed_str = ", ".join(changed) if changed else "None"
+            return (
+                f"Instruction in hand: {inst_in_hand}\n"
+                f"Micro-operation: {op}\n"
+                f"Changed: {changed_str}"
+            )
+
+        elif base == "next_inst":
+            inst, state = self.next_inst()
+            return (
+                f"Instruction executed: {inst}\n"
+                f"PC = 0x{state['PC']:03X}  AC = 0x{state['AC']:04X}"
+            )
+
+        elif base == "fast_inst":
+            if len(tokens) < 2 or not tokens[1].isdigit():
+                return "Usage: fast_inst N"
+            n = int(tokens[1])
+            inst, state = self.fast_inst(n)
+            return (
+                f"Instruction executed: {inst}\n"
+                f"PC = 0x{state['PC']:03X}  AC = 0x{state['AC']:04X}"
+            )
+
+        elif base == "run":
+            inst, state = self.run()
+            if self.halted:
+                return (
+                    "Program halted.\n"
+                    f"Final instruction: {inst}\n"
+                    f"PC = 0x{state['PC']:03X}  AC = 0x{state['AC']:04X}"
+                )
+            else:
+                return (
+                    "Run completed without halt.\n"
+                    f"Last instruction: {inst}\n"
+                    f"PC = 0x{state['PC']:03X}  AC = 0x{state['AC']:04X}"
+                )
+
+        elif base == "show":
+            if len(tokens) < 2:
+                return "Usage: show <reg|mem|all|profiler> [args]"
+            target = tokens[1].lower()
+
+            if target == "all":
+                return self.show_all()
+            elif target == "profiler":
+                return self.show_profiler()
+            elif target == "mem":
+                if len(tokens) < 3:
+                    return "Usage: show mem <addr> [count]"
+                addr_str = tokens[2]
+                try:
+                    if addr_str.lower().startswith("0x"):
+                        addr = int(addr_str, 16)
+                    else:
+                        addr = int(addr_str, 0)
+                except ValueError:
+                    return f"Invalid address: {addr_str}"
+
+                count = 1
+                if len(tokens) >= 4:
+                    try:
+                        count = int(tokens[3])
+                    except ValueError:
+                        return f"Invalid count: {tokens[3]}"
+                return self.show_memory(addr, count)
+            else:
+                return self.show_register(target)
+
+        elif base in ("exit", "quit"):
+            return ""
+
+        else:
+            return f"Unknown command: {tokens[0]}"
+
+
+def main():
+    import sys
+
+    # Only run CLI if in a real terminal
+    if not sys.stdin.isatty():
+        return
+
+    sim = BasicComputerSimulator()
+    try:
+        sim.load_program()
+    except FileNotFoundError:
+        print("Warning: program.txt not found. Memory initialised to zeros.\n", file=sys.stderr)
+
+    print("Basic Computer Simulator. Type 'help' for commands.\n")
+
+    while True:
+        try:
+            cmd = input("> ")
+        except EOFError:
+            break
+
+        cmd = cmd.strip()
+        if cmd.lower() == "help":
+            print(
+                "Available commands:\n"
+                "  next_cycle           – execute one clock cycle\n"
+                "  fast_cycle N         – execute N clock cycles\n"
+                "  next_inst            – execute one instruction\n"
+                "  fast_inst N          – execute N instructions\n"
+                "  run                  – run until halt\n"
+                "  show <reg>           – show a register (AC, DR, AR, PC, IR, TR, E, I)\n"
+                "  show mem <addr> [c]  – show memory word(s)\n"
+                "  show all             – show all registers and micro phase\n"
+                "  show profiler        – show profiling statistics\n"
+                "  exit, quit           – exit simulator"
+            )
+            continue
+
+        response = sim.execute_command(cmd)
+        if response == "":
+            break
+        print(response)
+
+
+if __name__ == "__main__":
+    main()
